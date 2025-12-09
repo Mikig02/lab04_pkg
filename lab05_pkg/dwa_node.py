@@ -76,9 +76,9 @@ class Dwa_node(Node):
         _, _, self.yaw = tf_transformations.euler_from_quaternion(quat) # get yaw from quaternion
 
     def scan_callback(self, msg: LaserScan): #callback for laser scan, chiedi a Michele parere su ciclo for
-     self.obstacles1 = np.array(msg.ranges)
+     self.raw_ranges = np.array(msg.ranges)
      self.obstacles1 = np.nan_to_num(  # convert NaN and inf to numbers
-     self.obstacles1,
+     self.raw_ranges,
      nan=msg.range_min,
      posinf=msg.range_max
         )
@@ -95,7 +95,7 @@ class Dwa_node(Node):
      self.filtered_obstacles = np.zeros(self.num_ranges) #array to store filtered obstacles of dimension num_ranges(ossia quanti settori voglio dividere il campo visivo del laser)
      step = int(len(self.obstacles)/self.num_ranges) #dimensione vari settori
      for i in range(self.num_ranges):
-        self.filtered_obstacles[i] = min(self.obstacles[i*step:(i+1)*step]) # prendo il minimo di ogni settore e lo metto in filtered_obstacles
+        self.filtered_obstacles[i] = min(self.obstacles[(i*step):(i+1)*step]) # prendo il minimo di ogni settore e lo metto in filtered_obstacles
     
 
      # ultima parte da vedere insieme a Michele
@@ -138,6 +138,161 @@ class Dwa_node(Node):
         self.get_logger().info('New goal received: ({:.2f}, {:.2f})'.format(self.goal_x, self.goal_y))
 
 
+    def simulate_paths(self, n_paths, pose, u):
+        """
+        Simulate trajectory at constant velocity u=(v,w)
+        """
+        sim_paths = np.zeros((n_paths, self.sim_step, pose.shape[0]))
+        sim_paths[:, 0] = pose.copy()
+
+        for i in range(1, self.sim_step): #for each values i'm simulating the trajectory
+            sim_paths[:, i, 0] = sim_paths[:, i - 1, 0] + u[:, 0] * np.cos(sim_paths[:, i - 1, 2]) * self.dt
+            sim_paths[:, i, 1] = sim_paths[:, i - 1, 1] + u[:, 0] * np.sin(sim_paths[:, i - 1, 2]) * self.dt
+            sim_paths[:, i, 2] = sim_paths[:, i - 1, 2] + u[:, 1] * self.dt
+
+        return sim_paths
+    
+
+    def get_trajectories(self, robot_pose): 
+    
+        # calculate reachable range of velocity and angular velocity in the dynamic window
+        min_lin_vel, max_lin_vel, min_ang_vel, max_ang_vel = self.compute_dynamic_window(self.robot.vel)
+        
+        v_values = np.linspace(min_lin_vel, max_lin_vel, self.v_samples)
+        w_values = np.linspace(min_ang_vel, max_ang_vel, self.w_samples) # i'm creating a grid of linear and angular velocities, and there are self.vsamples elements for the linear velocitiy and self.wsamples elements for the angular velocity
+
+        # list of all paths and velocities
+        n_paths = w_values.shape[0]*v_values.shape[0]
+        sim_paths = np.zeros((n_paths, self.sim_step, robot_pose.shape[0]))
+        velocities = np.zeros((n_paths, 2))
+
+        # evaluate all velocities and angular velocities combinations    
+        vv, ww = np.meshgrid(v_values, w_values)
+        velocities = np.dstack([vv,ww]).reshape(n_paths, 2)
+        sim_paths = self.simulate_paths(n_paths, robot_pose, velocities)
+
+        return sim_paths, velocities
+
+    def compute_cmd(self, goal_pose, robot_state, obstacles):
+
+        """
+        Compute the next velocity command u=(v,w) according to the DWA algorithm.
+        The velocity leading to the highest scored trajectory is selected.
+        """
+        # create path
+        paths, velocities = self.get_trajectories(robot_state) # simulate all the trajectories
+
+        # evaluate path
+        opt_idx = self.evaluate_paths(paths, velocities, goal_pose, robot_state, obstacles) # evaluate all the paths and select the best one
+        u = velocities[opt_idx] # select the optimal velocity
+        return u
+    def compute_dynamic_window(self, robot_vel): 
+        """
+        Calculate the dynamic window composed of reachable linear velocity and angular velocity according to robot's kinematic limits.
+        """
+        #given my velocity value, what is the min and max velocity I can reach in the next dt time
+        # linear velocity
+        min_vel = robot_vel[0] - self.dt * self.robot.max_linear_acc
+        max_vel = robot_vel[0] + self.dt * self.robot.max_linear_acc
+        # minimum
+        if min_vel < self.robot.min_lin_vel:
+            min_vel = self.robot.min_lin_vel
+        # maximum
+        if max_vel > self.robot.max_lin_vel:
+            max_vel = self.robot.max_lin_vel
+
+        # angular velocity
+        min_ang_vel = robot_vel[1] - self.dt * self.robot.max_ang_acc
+        max_ang_vel = robot_vel[1] + self.dt * self.robot.max_ang_acc
+        # minimum
+        if min_ang_vel < self.robot.min_ang_vel:
+            min_ang_vel = self.robot.min_ang_vel
+        # maximum
+        if max_ang_vel > self.robot.max_ang_vel:
+            max_ang_vel = self.robot.max_ang_vel
+
+        return min_vel, max_vel, min_ang_vel, max_ang_vel
+
+
+    def evaluate_paths(self, paths, velocities, goal_pose, robot_pose, obstacles):
+        """
+        Evaluate the simulated paths using the objective function.
+        J = w_h * heading + w_v * vel + w_o * obst_dist
+        """
+        # detect nearest obstacle
+        nearest_obs = calc_nearest_obs(robot_pose, obstacles)
+
+        # Compute the scores for the generated path
+        # (1) heading_angle and goal distance
+        score_heading_angles = self.score_heading_angle(paths, goal_pose)
+        # (2) velocity
+        score_vel = self.score_vel(velocities, paths, goal_pose)
+        # (3) obstacles
+        score_obstacles = self.score_obstacles(paths, nearest_obs) #most complex thing, this will be the distance from the obstacles
+
+        # Scores Normalization
+        score_heading_angles = normalize(score_heading_angles)
+        score_vel = normalize(score_vel)
+        score_obstacles = normalize(score_obstacles)
+
+        # Compute the idx of the optimal path according to the overall score
+        opt_idx = np.argmax(np.sum(
+            np.array([score_heading_angles, score_vel, score_obstacles])
+            * np.array([[self.weight_angle, self.weight_vel, self.weight_obs]]).T,
+            axis=0,
+        ))
+
+        try:
+            return opt_idx #this is the indx of the velocity that gives the best trajectory
+        except:
+            raise Exception("Not possible to find an optimal path")
+
+    def score_heading_angle(self, path, goal_pose):
+        """
+        Go towards the target objective: score trajectory according to the heading angle to the goal
+        """
+        last_x = path[:, -1, 0]
+        last_y = path[:, -1, 1]
+        last_th = path[:, -1, 2]
+
+        # calculate angle
+        angle_to_goal = np.arctan2(goal_pose[1] - last_y, goal_pose[0] - last_x)
+
+        # calculate score
+        score_angle = angle_to_goal - last_th
+        score_angle = np.fabs(normalize_angle(score_angle))
+        score_angle = np.pi - score_angle
+
+        return score_angle
+
+    def score_vel(self, u, path, goal_pose):
+        """
+        Maximum velocity objective: score trajectory according to the forward velocity. When the robot is near the goal, slow down.
+        """
+
+        vel = u[:,0] # linear velocity value is the score itself (to maximize)
+        dist_to_goal = np.linalg.norm(path[:, -1, 0:2] - goal_pose, axis=-1)
+        score = vel + np.exp(-dist_to_goal / self.goal_dist_tol)
+        return score
+
+    def score_obstacles(self, path, obstacles):
+        """
+        Obstacle avoidance objective: score trajectory according to the distance to the nearest obstacle.
+        """
+        score_obstacle = 2.0*np.ones((path.shape[0]))
+
+        for obs in obstacles:
+            dx = path[:, :, 0] - obs[0]
+            dy = path[:, :, 1] - obs[1]
+            dist = np.hypot(dx, dy)
+
+            min_dist = np.min(dist, axis=-1)
+            score_obstacle[min_dist < score_obstacle] = min_dist[min_dist < score_obstacle]
+        
+            # collision with obstacle
+            score_obstacle[score_obstacle < self.robot.radius + self.collision_tol] = -100 # heavy penalty for collision
+               
+        return score_obstacle
     def go_to_pose_callback(self): #core of the program, this generates command to reach a goal
        
      if not self.goal_received:
@@ -154,13 +309,18 @@ class Dwa_node(Node):
               return
        
             
+     self.robot_state=np.array([self.x,self.y])
+     self.goal_distance=np.array([self.goal_x,self.goal_y])
+     self.dist_to_goal=np.linalg.norm( self.robot_state - self.goal_distance )
      
-     
+     self.get_logger().info("Distance to goal:",self.dist_to_goal)
 
-      
-            
-    
+     self.goal_reached=False
 
+     if self.dist_to_goal < self.goal_dist_tol:
 
+        self.goal_reached = True
+
+        self.get_logger().info("Goal successfully reached!")
 
     
