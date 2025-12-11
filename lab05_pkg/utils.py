@@ -92,3 +92,5 @@ def normalize(arr: np.ndarray):
 def sigmoid(x: np.ndarray):
   """ compute sigmoid smoothing activation of a given array of values"""
   return 1/(1 + np.exp(-x)) 
+
+__all__ = ['normalize','calc_nearest_obs','normalize_angle']

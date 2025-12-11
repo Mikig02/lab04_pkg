@@ -6,6 +6,8 @@ from nav_msgs.msg import Odometry
 import tf_transformations
 import math
 import numpy as np
+from lab05_pkg.utils import * 
+
 
 class Dwa_node(Node):
     def __init__(self):
@@ -55,10 +57,27 @@ class Dwa_node(Node):
         self.goal_received = False
         self.goal_x = None
         self.goal_y = None
+        self.max_linear_acc = 2.5
+        self.max_ang_acc = 3.2
+        self.min_linear_vel=0.0
+        self.max_linear_vel=0.22
+        self.min_angular_vel=0.0
+        self.max_angular_vel=2.5 
+        self.sim_step = round(self.sim_time / self.time_granularity)
+        self.declare_parameter("robot_radius", 0.25) # O la dimensione del tuo robot
+        self.robot_radius = self.get_parameter("robot_radius").value
+        self.feedback_steps_max=50
+        self.initial_feedback_step=0
 
+        self.x = 0.0
+        self.y = 0.0
+        self.yaw = 0.0
+        self.robot_velocity = np.array([0.0, 0.0])
         
+        # Inizializziamo obstacles_xy vuoto per evitare crash se non c'è scan
+        self.obstacles_xy = np.empty((0, 2)) 
+        self.filtered_obstacles = np.full(self.num_ranges, np.inf)
 
-        
         #=== TIMER ===
         self.timer = self.create_timer(1.0 / self.frequency, self.go_to_pose_callback)
 
@@ -74,6 +93,7 @@ class Dwa_node(Node):
         q = msg.pose.pose.orientation # get orientation quaternion
         quat = [q.x, q.y, q.z, q.w] # convert quaternion to list
         _, _, self.yaw = tf_transformations.euler_from_quaternion(quat) # get yaw from quaternion
+        self.robot_velocity=np.array([msg.twist.twist.linear.x,msg.twist.twist.angular.z])
 
     def scan_callback(self, msg: LaserScan): #callback for laser scan, chiedi a Michele parere su ciclo for
      self.raw_ranges = np.array(msg.ranges)
@@ -88,8 +108,9 @@ class Dwa_node(Node):
              self.obstacles[i] = self.obstacles1[i]
          else:
             self.obstacles[i] = np.inf
-        #  if self.obstacles[i]  <= self.obst_tolerance:
-        #     self.get_logger().info('detected obstacle at: {:.2f} m'.format(self.obstacles[i])) 
+
+     if self.obstacles[i]  <= self.obst_tolerance:
+        self.get_logger().info('detected obstacle at: {:.2f} m'.format(self.obstacles[i])) 
     
      #Filter scan ranges 
      self.filtered_obstacles = np.zeros(self.num_ranges) #array to store filtered obstacles of dimension num_ranges(ossia quanti settori voglio dividere il campo visivo del laser)
@@ -138,7 +159,7 @@ class Dwa_node(Node):
         self.get_logger().info('New goal received: ({:.2f}, {:.2f})'.format(self.goal_x, self.goal_y))
 
 
-    def simulate_paths(self, n_paths, pose, u):
+    def simulate_paths(self, n_paths, pose, u): #pose given by odometry
         """
         Simulate trajectory at constant velocity u=(v,w)
         """
@@ -156,7 +177,7 @@ class Dwa_node(Node):
     def get_trajectories(self, robot_pose): 
     
         # calculate reachable range of velocity and angular velocity in the dynamic window
-        min_lin_vel, max_lin_vel, min_ang_vel, max_ang_vel = self.compute_dynamic_window(self.robot.vel)
+        min_lin_vel, max_lin_vel, min_ang_vel, max_ang_vel = self.compute_dynamic_window(self.robot_velocity)
         
         v_values = np.linspace(min_lin_vel, max_lin_vel, self.v_samples)
         w_values = np.linspace(min_ang_vel, max_ang_vel, self.w_samples) # i'm creating a grid of linear and angular velocities, and there are self.vsamples elements for the linear velocitiy and self.wsamples elements for the angular velocity
@@ -186,30 +207,34 @@ class Dwa_node(Node):
         opt_idx = self.evaluate_paths(paths, velocities, goal_pose, robot_state, obstacles) # evaluate all the paths and select the best one
         u = velocities[opt_idx] # select the optimal velocity
         return u
+    
     def compute_dynamic_window(self, robot_vel): 
         """
         Calculate the dynamic window composed of reachable linear velocity and angular velocity according to robot's kinematic limits.
         """
         #given my velocity value, what is the min and max velocity I can reach in the next dt time
         # linear velocity
-        min_vel = robot_vel[0] - self.dt * self.robot.max_linear_acc
-        max_vel = robot_vel[0] + self.dt * self.robot.max_linear_acc
+
+        min_vel = robot_vel[0] - self.dt * self.max_linear_acc
+
+        max_vel = robot_vel[0] + self.dt * self.max_linear_acc
+
         # minimum
-        if min_vel < self.robot.min_lin_vel:
-            min_vel = self.robot.min_lin_vel
+        if min_vel < self.min_linear_vel:
+            min_vel = self.min_linear_vel
         # maximum
-        if max_vel > self.robot.max_lin_vel:
-            max_vel = self.robot.max_lin_vel
+        if max_vel > self.max_linear_vel:
+            max_vel = self.max_linear_vel
 
         # angular velocity
-        min_ang_vel = robot_vel[1] - self.dt * self.robot.max_ang_acc
-        max_ang_vel = robot_vel[1] + self.dt * self.robot.max_ang_acc
+        min_ang_vel = robot_vel[1] - self.dt * self.max_ang_acc
+        max_ang_vel = robot_vel[1] + self.dt * self.max_ang_acc
         # minimum
-        if min_ang_vel < self.robot.min_ang_vel:
-            min_ang_vel = self.robot.min_ang_vel
+        if min_ang_vel < self.min_angular_vel:
+            min_ang_vel = self.min_angular_vel
         # maximum
-        if max_ang_vel > self.robot.max_ang_vel:
-            max_ang_vel = self.robot.max_ang_vel
+        if max_ang_vel > self.max_angular_vel:
+            max_ang_vel = self.max_angular_vel
 
         return min_vel, max_vel, min_ang_vel, max_ang_vel
 
@@ -290,30 +315,45 @@ class Dwa_node(Node):
             score_obstacle[min_dist < score_obstacle] = min_dist[min_dist < score_obstacle]
         
             # collision with obstacle
-            score_obstacle[score_obstacle < self.robot.radius + self.collision_tol] = -100 # heavy penalty for collision
+            score_obstacle[score_obstacle < self.robot_radius + self.collision_tol] = -100 # heavy penalty for collision
                
         return score_obstacle
+    
     def go_to_pose_callback(self): #core of the program, this generates command to reach a goal
-       
+     
+     msg=Twist()
+     self.initial_feedback_step+=1
+     self.robot_state=np.array([self.x,self.y,self.yaw])
+     self.goal_position=np.array([self.goal_x,self.goal_y])
+     self.robot_x_y=np.array([self.x,self.y])
+     self.dist_to_goal=np.linalg.norm(self.robot_x_y - self.goal_position)
+     self.get_logger().info(f"Distance to goal: {self.dist_to_goal:.2f}")
+
      if not self.goal_received:
           self.get_logger().info("Waiting for goal...")
           return
      
-       #safety check
+    #safety check
      if np.min(self.filtered_obstacles) < 0.25:
+              
               self.get_logger().info('Obstacle too close! Stopping robot.')
               cmd = Twist()
               cmd.linear.x = 0.0
               cmd.angular.z = 0.0
               self.cmd_pub.publish(cmd)
               return
-       
-            
-     self.robot_state=np.array([self.x,self.y])
-     self.goal_distance=np.array([self.goal_x,self.goal_y])
-     self.dist_to_goal=np.linalg.norm( self.robot_state - self.goal_distance )
-     
-     self.get_logger().info("Distance to goal:",self.dist_to_goal)
+     else:
+        self.command=self.compute_cmd(self.goal_position,self.robot_state,self.obstacles_xy)
+        msg.linear.x=self.command[0]
+        msg.angular.z=self.command[1]
+        self.get_logger().info(f"Publishing vel: {msg}")
+        self.cmd_pub.publish(msg)
+
+     self.robot_state=np.array([self.x,self.y,self.yaw])
+     self.goal_position=np.array([self.goal_x,self.goal_y])
+     self.robot_x_y=np.array([self.x,self.y])
+     self.dist_to_goal=np.linalg.norm(self.robot_x_y - self.goal_position)
+     self.get_logger().info(f"Distance to goal: {self.dist_to_goal:.2f}")
 
      self.goal_reached=False
 
@@ -323,4 +363,34 @@ class Dwa_node(Node):
 
         self.get_logger().info("Goal successfully reached!")
 
+        
+
+     if self.initial_feedback_step > self.feedback_steps_max:
+
+        self.get_logger().warn("Check the goal distance!!!")
+
+        dist_to_goal = np.linalg.norm(self.robot_state[0:2] - self.goal_position)
+                                      
+        self.get_logger().warn(f"Current robot pose: {self.robot_state[0:2]} m")
+
+        self.get_logger().warn(f"Distance to goal: {dist_to_goal:.2f} m")
+
+        self.initial_feedback_step=0
+
+def main():
+    rclpy.init()
+    node = Dwa_node()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
     
+     
+
+     
+
+
+

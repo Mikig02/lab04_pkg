@@ -24,6 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'dwa_node = lab05_pkg.dwa_node:main'
         ],
     },
 )
