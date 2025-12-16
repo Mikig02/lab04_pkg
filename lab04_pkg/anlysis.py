@@ -196,7 +196,7 @@ plt.axis('equal')
 plt.savefig("trajectory_aligned.png", dpi=300)
 plt.show()
 
-if len(t_cmd) > 0:
+if len(t_cmd) > 0: #allineamento del tempo 
     t_cmd = t_cmd - t_cmd[0]
 
 # 2. Creazione Plot usando la tua "forma"
