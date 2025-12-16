@@ -35,7 +35,7 @@ class Dwa_node(Node):
         self.declare_parameter("obst_tolerance", 0.5) # obstacle tolerance distance
         self.declare_parameter("frequency", 15.0) # go_to_pose_callback frequency
         self.declare_parameter("num_ranges", 27) # ranges to consider from laser scan
-        
+        self.declare_parameter("robot_radius", 0.15) #  la dimensione del  robot
 
 
         self.dt = self.get_parameter("dt").value
@@ -59,6 +59,8 @@ class Dwa_node(Node):
         self.obst_tolerance = self.get_parameter("obst_tolerance").value 
         self.frequency = self.get_parameter("frequency").value
         self.num_ranges = self.get_parameter("num_ranges").value
+        self.robot_radius = self.get_parameter("robot_radius").value
+
         self.goal_received = False
         self.goal_x = None
         self.goal_y = None
@@ -69,8 +71,7 @@ class Dwa_node(Node):
         self.min_angular_vel= -1.
         self.max_angular_vel=1.
         self.sim_step = round(self.sim_time / self.time_granularity)
-        self.declare_parameter("robot_radius", 0.15) # O la dimensione del tuo robot
-        self.robot_radius = self.get_parameter("robot_radius").value
+        
         self.feedback_steps_max=50
         self.initial_feedback_step=0
 
@@ -425,7 +426,7 @@ class Dwa_node(Node):
         self.command=self.compute_cmd(self.goal_position,self.robot_state,self.obstacles_xy)
         msg.linear.x=self.command[0]
         msg.angular.z=self.command[1]
-        self.get_logger().info(f"Publishing vel: {msg}")
+        #self.get_logger().info(f"Publishing vel: {msg}")
         self.cmd_pub.publish(msg)
 
      self.robot_state=np.array([self.x,self.y,self.yaw])
@@ -437,7 +438,7 @@ class Dwa_node(Node):
         feedback_msg = Float32()
         feedback_msg.data = float(self.dist_to_goal)
         self.feedback_pub.publish(feedback_msg)
-       #self.get_logger().info(f"Distance to goal: {self.dist_to_goal:.2f}")
+        #self.get_logger().info(f"Distance to goal: {self.dist_to_goal:.2f}")
 
         self.goal_reached=False
 
@@ -460,7 +461,7 @@ class Dwa_node(Node):
 
     # controllo Timeout sul numero massimo di passi
      if self.step_count > self.max_num_steps:
-        self.get_logger().warn("Timeout reached, stopping robot.")
+        #self.get_logger().warn("Timeout reached, stopping robot.")
         cmd = Twist()
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
